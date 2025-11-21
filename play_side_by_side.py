@@ -5,9 +5,11 @@ from pathlib import Path
 import sys
 import math
 import pickle
+from collections import defaultdict
 from pacman_env import PacmanEnv
 from train_pacman_dqn import DQNAgent
 from train_pacman_ddqn import DoubleDQNAgent
+from train_pacman_qn import QLearningAgent
 
 # Display settings
 TILE_SIZE = 20
@@ -36,34 +38,6 @@ GHOST_BOB_AMPLITUDE = 2
 GHOST_BOB_PERIOD = 20
 
 
-# Q-Learning Agent class for loading
-class QLearningAgent:
-    """Q-learning agent for playback"""
-    def __init__(self, n_actions, q_table):
-        self.n_actions = n_actions
-        self.q_table = q_table
-    
-    def discretize_state(self, state):
-        """Same discretization as training"""
-        x_pac, y_pac, x_g1, y_g1, x_g2, y_g2 = state
-        dx1 = int(np.clip((x_g1 - x_pac) / 5, -4, 4))
-        dy1 = int(np.clip((y_g1 - y_pac) / 3, -3, 3))
-        dx2 = int(np.clip((x_g2 - x_pac) / 5, -4, 4))
-        dy2 = int(np.clip((y_g2 - y_pac) / 3, -3, 3))
-        px_bin = int(x_pac / 4)
-        py_bin = int(y_pac / 3)
-        return (px_bin, py_bin, dx1, dy1, dx2, dy2)
-    
-    def select_action(self, state):
-        """Greedy action selection"""
-        state_key = self.discretize_state(state)
-        if state_key in self.q_table:
-            q_values = self.q_table[state_key]
-            return np.argmax(q_values)
-        else:
-            return np.random.randint(self.n_actions)
-
-
 def extract_state(env):
     y, x = env.pacman_pos
     ghosts = env.ghost_positions
@@ -73,14 +47,70 @@ def extract_state(env):
     return np.array([x, y, g1x, g1y, g2x, g2y], dtype=np.float32)
 
 
+def select_checkpoints(dqn_dir, ddqn_dir, qn_dir):
+    """Interactive checkpoint selection for all three algorithms"""
+    dqn_checkpoints = sorted(dqn_dir.glob("checkpoint_ep*.pt"))
+    ddqn_checkpoints = sorted(ddqn_dir.glob("checkpoint_ep*.pt"))
+    qn_checkpoints = sorted(qn_dir.glob("checkpoint_ep*.pkl"))
+    
+    if not dqn_checkpoints or not ddqn_checkpoints or not qn_checkpoints:
+        print(f"❌ Missing checkpoints!")
+        print(f"DQN checkpoints found: {len(dqn_checkpoints)}")
+        print(f"DDQN checkpoints found: {len(ddqn_checkpoints)}")
+        print(f"Q-Learning checkpoints found: {len(qn_checkpoints)}")
+        print(f"\nTrain missing models:")
+        if not dqn_checkpoints:
+            print("  - DQN: python train_pacman_dqn.py")
+        if not ddqn_checkpoints:
+            print("  - DDQN: python train_pacman_ddqn.py")
+        if not qn_checkpoints:
+            print("  - Q-Learning: python train_pacman_qn.py")
+        sys.exit(1)
+    
+    # Build episode mappings
+    dqn_episodes = {int(cp.stem.split("ep")[1]): cp for cp in dqn_checkpoints}
+    ddqn_episodes = {int(cp.stem.split("ep")[1]): cp for cp in ddqn_checkpoints}
+    qn_episodes = {int(cp.stem.split("ep")[1]): cp for cp in qn_checkpoints}
+    
+    common_episodes = sorted(set(dqn_episodes.keys()) & set(ddqn_episodes.keys()) & set(qn_episodes.keys()))
+    
+    if not common_episodes:
+        print("\n⚠️  No common episodes found across all algorithms!")
+        print(f"DQN episodes: {min(dqn_episodes.keys())} - {max(dqn_episodes.keys())}")
+        print(f"DDQN episodes: {min(ddqn_episodes.keys())} - {max(ddqn_episodes.keys())}")
+        print(f"Q-Learning episodes: {min(qn_episodes.keys())} - {max(qn_episodes.keys())}")
+        sys.exit(1)
+    
+    print("\nAvailable checkpoints:")
+    for i, ep in enumerate(common_episodes):
+        print(f"{i + 1}. Episode {ep:4d}")
+    
+    while True:
+        choice = input("\nSelect checkpoint number (or 'q' to quit): ").strip()
+        if choice.lower() == 'q':
+            sys.exit(0)
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(common_episodes):
+                ep = common_episodes[idx]
+                return dqn_episodes[ep], ddqn_episodes[ep], qn_episodes[ep]
+            else:
+                print(f"Enter a number between 1 and {len(common_episodes)}")
+        except ValueError:
+            print("Invalid input. Enter a number.")
+
+
 def load_agent(checkpoint_path, algorithm='DQN'):
     print(f"📂 Loading {algorithm} from: {checkpoint_path.name}")
     
     if algorithm == 'Q-Learning':
         with open(checkpoint_path, 'rb') as f:
             checkpoint = pickle.load(f)
-        q_table = checkpoint['q_table']
-        agent = QLearningAgent(4, q_table)
+        config = checkpoint['config']
+        agent = QLearningAgent(4, config)
+        agent.q_table = defaultdict(lambda: np.zeros(4), checkpoint['q_table'])
+        agent.epsilon = checkpoint['epsilon']
+        agent.steps_done = checkpoint['steps_done']
         episode = checkpoint['episode']
     else:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -203,43 +233,29 @@ def draw_stats(surface, stats_dqn, stats_ddqn, stats_qn, font, small_font):
 
 
 def main():
+    # Load checkpoints BEFORE initializing pygame
+    script_dir = Path(__file__).parent
+    dqn_dir = script_dir / "checkpoints_pacman_dqn"
+    ddqn_dir = script_dir / "checkpoints_pacman_ddqn"
+    qn_dir = script_dir / "checkpoints_pacman_qn"
+    
+    # Interactive checkpoint selection
+    dqn_checkpoint, ddqn_checkpoint, qn_checkpoint = select_checkpoints(dqn_dir, ddqn_dir, qn_dir)
+    
+    print("\n🎮 Side-by-Side Agent Comparison (3 Agents)")
+    print("="*60)
+    
+    dqn_agent, dqn_ep = load_agent(dqn_checkpoint, 'DQN')
+    ddqn_agent, ddqn_ep = load_agent(ddqn_checkpoint, 'Double DQN')
+    qn_agent, qn_ep = load_agent(qn_checkpoint, 'Q-Learning')
+    
+    # Initialize pygame AFTER checkpoint selection
     pygame.init()
     pygame.display.set_caption("Side-by-Side: DQN vs Double DQN vs Q-Learning")
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 32)
     small_font = pygame.font.Font(None, 20)
-    
-    # Load checkpoints
-    script_dir = Path(__file__).parent
-    dqn_dir = script_dir / "checkpoints_pacman_dqn"
-    ddqn_dir = script_dir / "checkpoints_pacman_ddqn"
-    qn_dir = script_dir / "checkpoints_pacman_qn"
-    
-    dqn_checkpoints = sorted(dqn_dir.glob("checkpoint_ep*.pt"))
-    ddqn_checkpoints = sorted(ddqn_dir.glob("checkpoint_ep*.pt"))
-    qn_checkpoints = sorted(qn_dir.glob("checkpoint_ep*.pkl"))
-    
-    if not dqn_checkpoints or not ddqn_checkpoints or not qn_checkpoints:
-        print(f"❌ Missing checkpoints!")
-        print(f"DQN checkpoints found: {len(dqn_checkpoints)}")
-        print(f"DDQN checkpoints found: {len(ddqn_checkpoints)}")
-        print(f"Q-Learning checkpoints found: {len(qn_checkpoints)}")
-        print(f"\nTrain missing models:")
-        if not dqn_checkpoints:
-            print("  - DQN: python train_pacman_dqn.py")
-        if not ddqn_checkpoints:
-            print("  - DDQN: python train_pacman_ddqn.py")
-        if not qn_checkpoints:
-            print("  - Q-Learning: python train_pacman_qn.py")
-        return
-    
-    print("\n🎮 Side-by-Side Agent Comparison (3 Agents)")
-    print("="*60)
-    
-    dqn_agent, dqn_ep = load_agent(dqn_checkpoints[-1], 'DQN')
-    ddqn_agent, ddqn_ep = load_agent(ddqn_checkpoints[-1], 'Double DQN')
-    qn_agent, qn_ep = load_agent(qn_checkpoints[-1], 'Q-Learning')
     
     # Create environments
     env_dqn = PacmanEnv(render_mode=None)
